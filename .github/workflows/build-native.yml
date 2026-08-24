@@ -1,0 +1,44 @@
+name: Build C++ Native Proxy (.so)
+
+on:
+  push:
+    paths:
+      - 'cpp/**'
+      - '.github/workflows/build_native.yml'
+  workflow_dispatch:
+
+jobs:
+  build-native:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nsetup/setup-android-ndk@v1
+        with:
+          ndk-version: r26b
+
+      - name: Compile native_proxy.cpp for arm64-v8a & armeabi-v7a
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          mkdir -p app/src/main/jniLibs/armeabi-v7a
+          
+          # Build arm64-v8a shared library
+          $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++ \
+            -shared -fPIC -std=c++17 -O3 \
+            app/src/main/cpp/native_proxy.cpp \
+            -o app/src/main/jniLibs/arm64-v8a/libnative_proxy.so -llog
+
+          # Build armeabi-v7a shared library
+          $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang++ \
+            -shared -fPIC -std=c++17 -O3 \
+            app/src/main/cpp/native_proxy.cpp \
+            -o app/src/main/jniLibs/armeabi-v7a/libnative_proxy.so -llog
+
+      - name: Upload Prebuilt .so Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-proxy-so-libs
+          path: app/src/main/jniLibs/
+          
