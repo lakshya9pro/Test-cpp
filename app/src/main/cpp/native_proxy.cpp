@@ -419,7 +419,7 @@ void handle_client_connection(int client_fd) {
     remote_req << method << " " << target.path << " HTTP/1.1\r\n";
     remote_req << "Host: " << target.host << "\r\n";
 
-    if (target.host.find("turboviplay") != std::string::npos || target.host.find("turbovid") != std::string::npos || target_url.find("turbovid") != std::string::npos) {
+    if (target.host.find("turboviplay") != std::string::npos || target.host.find("turbovid") != std::string::npos || target.host.find("turbosplayer") != std::string::npos || target_url.find("turbovid") != std::string::npos || target_url.find("turbosplayer") != std::string::npos) {
         remote_req << "Referer: https://turbovidhls.com/\r\n";
         remote_req << "Origin: https://turbovidhls.com\r\n";
     } else {
@@ -593,104 +593,4 @@ void server_loop(int port) {
     if (listen(sfd, 128) != 0) {
         LOGE("Failed to listen on server socket");
         close(sfd);
-        g_running = false;
-        return;
-    }
-
-    g_server_fd = sfd;
-    g_server_port = port;
-    g_running = true;
-    LOGI("C++ Native Proxy Server started on 127.0.0.1:%d", port);
-
-    while (g_running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(sfd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd < 0) {
-            if (!g_running) break;
-            continue;
-        }
-
-        std::thread([client_fd]() {
-            handle_client_connection(client_fd);
-        }).detach();
-    }
-
-    close(sfd);
-    g_server_fd = -1;
-    LOGI("C++ Native Proxy Server stopped");
-}
-
-int start_proxy(int port) {
-    if (g_running) return g_server_port.load();
-    int target_port = (port > 0) ? port : 1658;
-    g_server_thread = std::thread(server_loop, target_port);
     
-    int wait_counter = 0;
-    while (!g_running && wait_counter < 50) {
-        usleep(10000);
-        wait_counter++;
-    }
-
-    return g_running ? g_server_port.load() : -1;
-}
-
-void stop_proxy() {
-    g_running = false;
-    int sfd = g_server_fd.exchange(-1);
-    if (sfd >= 0) {
-        shutdown(sfd, SHUT_RDWR);
-        close(sfd);
-    }
-    if (g_server_thread.joinable()) {
-        g_server_thread.join();
-    }
-}
-
-} // namespace native_proxy
-
-// ─── JNI Exports ─────────────────────────────────────────────────────────────
-
-extern "C" {
-
-// Package: com.batz.tvlauncher.proxy
-JNIEXPORT jint JNICALL
-Java_com_batz_tvlauncher_proxy_ProxyHandler_nativeStartProxy(JNIEnv* env, jobject thiz, jint port) {
-    return native_proxy::start_proxy(port);
-}
-
-JNIEXPORT void JNICALL
-Java_com_batz_tvlauncher_proxy_ProxyHandler_nativeStopProxy(JNIEnv* env, jobject thiz) {
-    native_proxy::stop_proxy();
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_batz_tvlauncher_proxy_ProxyHandler_nativeIsRunning(JNIEnv* env, jobject thiz) {
-    return native_proxy::g_running.load() ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jint JNICALL
-Java_com_batz_tvlauncher_proxy_ProxyHandler_nativeGetPort(JNIEnv* env, jobject thiz) {
-    return native_proxy::g_server_port.load();
-}
-
-JNIEXPORT jstring JNICALL
-Java_com_batz_tvlauncher_proxy_ProxyHandler_nativeRewriteM3U8(
-        JNIEnv* env, jobject thiz,
-        jstring content_, jstring baseUrl_, jstring proxyHost_) {
-    if (!content_ || !baseUrl_ || !proxyHost_) return env->NewStringUTF("");
-
-    const char* content = env->GetStringUTFChars(content_, nullptr);
-    const char* baseUrl = env->GetStringUTFChars(baseUrl_, nullptr);
-    const char* proxyHost = env->GetStringUTFChars(proxyHost_, nullptr);
-
-    std::string rewritten = native_proxy::rewrite_m3u8(content, baseUrl, proxyHost);
-
-    env->ReleaseStringUTFChars(content_, content);
-    env->ReleaseStringUTFChars(baseUrl_, baseUrl);
-    env->ReleaseStringUTFChars(proxyHost_, proxyHost);
-
-    return env->NewStringUTF(rewritten.c_str());
-}
-
-}
