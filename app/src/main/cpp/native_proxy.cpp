@@ -58,7 +58,9 @@ void init_ssl() {
         SSL_load_error_strings();
         OpenSSL_add_all_algorithms();
         g_ssl_ctx = SSL_CTX_new(TLS_client_method());
-        if (!g_ssl_ctx) {
+        if (g_ssl_ctx) {
+            SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, nullptr);
+        } else {
             LOGE("Failed to create OpenSSL context");
         }
     });
@@ -373,10 +375,6 @@ void handle_client_connection(int client_fd) {
     size_t qpos = path_uri.find("url=");
     if (qpos != std::string::npos) {
         target_url_encoded = path_uri.substr(qpos + 4);
-        size_t amppos = target_url_encoded.find('&');
-        if (amppos != std::string::npos) {
-            target_url_encoded = target_url_encoded.substr(0, amppos);
-        }
     }
 
     if (target_url_encoded.empty()) {
@@ -593,7 +591,7 @@ void server_loop(int port) {
     if (listen(sfd, 128) != 0) {
         LOGE("Failed to listen on server socket");
         close(sfd);
-g_running = false;
+        g_running = false;
         return;
     }
 
@@ -694,6 +692,3 @@ Java_com_batz_tvlauncher_proxy_ProxyHandler_nativeRewriteM3U8(
 }
 
 }
-
-
-    
