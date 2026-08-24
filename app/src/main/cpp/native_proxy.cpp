@@ -24,6 +24,8 @@
 #include <mutex>
 #include <regex>
 #include <unordered_map>
+#include <cctype>
+#include <chrono>
 #include <android/log.h>
 
 #define LOG_TAG "NativeProxy"
@@ -90,15 +92,17 @@ std::string url_decode(const std::string& in) {
 }
 
 std::string url_encode(const std::string& in) {
+    static const char* hex = "0123456789ABCDEF";
     std::string out;
     out.reserve(in.size() * 3);
-    for (char c : in) {
-        if (isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/' || c == ':' || c == '?' || c == '=' || c == '&') {
-            out += c;
+
+    for (unsigned char c : in) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += static_cast<char>(c);
         } else {
-            char buf[4];
-            snprintf(buf, sizeof(buf), "%%%02X", static_cast<unsigned char>(c));
-            out += buf;
+            out += '%';
+            out += hex[(c >> 4) & 0x0F];
+            out += hex[c & 0x0F];
         }
     }
     return out;
@@ -116,30 +120,54 @@ bool parse_url(const std::string& url_str, ParsedUrl& out) {
     size_t scheme_pos = s.find("://");
     if (scheme_pos == std::string::npos) return false;
 
+    out = ParsedUrl{};
     out.scheme = s.substr(0, scheme_pos);
-    std::transform(out.scheme.begin(), out.scheme.end(), out.scheme.begin(), ::tolower);
+    std::transform(out.scheme.begin(), out.scheme.end(), out.scheme.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (out.scheme != "http" && out.scheme != "https") return false;
 
     std::string rest = s.substr(scheme_pos + 3);
-    size_t path_pos = rest.find('/');
-    std::string host_port;
-    if (path_pos == std::string::npos) {
-        host_port = rest;
+
+    size_t authority_end = rest.find_first_of("/?#");
+    std::string host_port = (authority_end == std::string::npos)
+                            ? rest : rest.substr(0, authority_end);
+
+    if (host_port.empty()) return false;
+
+    if (authority_end == std::string::npos) {
         out.path = "/";
     } else {
-        host_port = rest.substr(0, path_pos);
-        out.path = rest.substr(path_pos);
+        out.path = rest.substr(authority_end);
+        if (out.path.empty() || out.path[0] == '?' || out.path[0] == '#') {
+            out.path = "/" + out.path;
+        }
     }
 
-    size_t colon_pos = host_port.find(':');
-    if (colon_pos != std::string::npos) {
-        out.host = host_port.substr(0, colon_pos);
-        out.port = atoi(host_port.substr(colon_pos + 1).c_str());
+    // IPv6 literal: [::1]:8080
+    if (!host_port.empty() && host_port[0] == '[') {
+        size_t rb = host_port.find(']');
+        if (rb == std::string::npos) return false;
+        out.host = host_port.substr(0, rb + 1);
+        if (rb + 1 < host_port.size() && host_port[rb + 1] == ':') {
+            out.port = std::atoi(host_port.substr(rb + 2).c_str());
+        } else {
+            out.port = (out.scheme == "https") ? 443 : 80;
+        }
     } else {
-        out.host = host_port;
-        out.port = (out.scheme == "https") ? 443 : 80;
+        size_t colon_pos = host_port.rfind(':');
+        if (colon_pos != std::string::npos &&
+            host_port.find(':') == colon_pos) {
+            out.host = host_port.substr(0, colon_pos);
+            out.port = std::atoi(host_port.substr(colon_pos + 1).c_str());
+        } else {
+            out.host = host_port;
+            out.port = (out.scheme == "https") ? 443 : 80;
+        }
     }
 
-    return !out.host.empty();
+    if (out.host.empty() || out.port <= 0 || out.port > 65535) return false;
+    return true;
 }
 
 std::string resolve_url(const std::string& base_str, const std::string& ref_str) {
@@ -150,7 +178,8 @@ std::string resolve_url(const std::string& base_str, const std::string& ref_str)
     if (!parse_url(base_str, base)) return ref_str;
 
     std::string host_part = base.scheme + "://" + base.host;
-    if ((base.scheme == "http" && base.port != 80) || (base.scheme == "https" && base.port != 443)) {
+    if ((base.scheme == "http" && base.port != 80) ||
+        (base.scheme == "https" && base.port != 443)) {
         host_part += ":" + std::to_string(base.port);
     }
 
@@ -158,19 +187,31 @@ std::string resolve_url(const std::string& base_str, const std::string& ref_str)
         return base.scheme + ":" + ref_str;
     }
 
+    // Query-only / fragment-only reference.
+    if (ref_str[0] == '?' || ref_str[0] == '#') {
+        std::string base_no_fragment = base_str;
+        size_t hash = base_no_fragment.find('#');
+        if (hash != std::string::npos) base_no_fragment.resize(hash);
+        if (ref_str[0] == '?') {
+            size_t q = base_no_fragment.find('?');
+            if (q != std::string::npos) base_no_fragment.resize(q);
+        }
+        return base_no_fragment + ref_str;
+    }
+
     if (ref_str[0] == '/') {
         return host_part + ref_str;
     }
 
-    std::string base_path_dir = base.path;
-    size_t qmark = base_path_dir.find('?');
-    if (qmark != std::string::npos) base_path_dir = base_path_dir.substr(0, qmark);
-    size_t last_slash = base_path_dir.find_last_of('/');
-    if (last_slash != std::string::npos) {
-        base_path_dir = base_path_dir.substr(0, last_slash + 1);
-    } else {
-        base_path_dir = "/";
-    }
+    std::string base_path = base.path;
+    size_t qmark = base_path.find('?');
+    if (qmark != std::string::npos) base_path.resize(qmark);
+    size_t hash = base_path.find('#');
+    if (hash != std::string::npos) base_path.resize(hash);
+
+    size_t last_slash = base_path.find_last_of('/');
+    std::string base_path_dir =
+        (last_slash != std::string::npos) ? base_path.substr(0, last_slash + 1) : "/";
 
     return host_part + base_path_dir + ref_str;
 }
@@ -320,6 +361,23 @@ bool connect_remote(const ParsedUrl& target, SocketStream& stream) {
     return true;
 }
 
+void send_simple_response(int fd, const std::string& status,
+                           const std::string& content_type,
+                           const std::string& body) {
+    std::ostringstream out;
+    out << "HTTP/1.1 " << status << "\r\n"
+        << "Content-Type: " << content_type << "\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Access-Control-Allow-Origin: *\r\n"
+        << "Access-Control-Allow-Methods: GET, POST, OPTIONS, HEAD\r\n"
+        << "Access-Control-Allow-Headers: *\r\n"
+        << "Access-Control-Expose-Headers: *\r\n"
+        << "Connection: close\r\n\r\n"
+        << body;
+    std::string data = out.str();
+    send(fd, data.data(), data.size(), 0);
+}
+
 void handle_client_connection(int client_fd) {
     struct timeval tv;
     tv.tv_sec = 15;
@@ -340,9 +398,24 @@ void handle_client_connection(int client_fd) {
     std::string method, path_uri, version;
     req_stream >> method >> path_uri >> version;
 
+    if (method.empty() || path_uri.empty()) {
+        send_simple_response(client_fd, "400 Bad Request", "text/plain", "Bad Request");
+        close(client_fd);
+        return;
+    }
+
+    // Local diagnostics. Opening http://127.0.0.1:<port>/ must prove
+    // that the native server is actually listening.
+    if (path_uri == "/" || path_uri == "/health") {
+        send_simple_response(client_fd, "200 OK", "application/json",
+                             R"({"ok":true,"server":"native_proxy"})");
+        close(client_fd);
+        return;
+    }
+
     std::unordered_map<std::string, std::string> headers;
     std::string header_line;
-    std::string host_header = "localhost";
+    std::string host_header = "127.0.0.1:" + std::to_string(g_server_port.load());
     
     while (std::getline(req_stream, header_line) && header_line != "\r" && !header_line.empty()) {
         if (!header_line.empty() && header_line.back() == '\r') header_line.pop_back();
@@ -371,10 +444,23 @@ void handle_client_connection(int client_fd) {
         return;
     }
 
+    if (path_uri.rfind("/proxy", 0) != 0) {
+        send_simple_response(client_fd, "404 Not Found", "application/json",
+                             R"({"error":"Use /proxy?url=<encoded-url>"})");
+        close(client_fd);
+        return;
+    }
+
     std::string target_url_encoded;
-    size_t qpos = path_uri.find("url=");
-    if (qpos != std::string::npos) {
-        target_url_encoded = path_uri.substr(qpos + 4);
+    size_t query_pos = path_uri.find('?');
+    if (query_pos != std::string::npos) {
+        std::string query = path_uri.substr(query_pos + 1);
+        size_t p = query.find("url=");
+        if (p != std::string::npos) {
+            target_url_encoded = query.substr(p + 4);
+            size_t amp = target_url_encoded.find('&');
+            if (amp != std::string::npos) target_url_encoded.resize(amp);
+        }
     }
 
     if (target_url_encoded.empty()) {
@@ -566,9 +652,15 @@ void handle_client_connection(int client_fd) {
 }
 
 void server_loop(int port) {
+    if (port < 1024 || port > 65535) {
+        LOGE("Invalid server port: %d", port);
+        g_running = false;
+        return;
+    }
+
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sfd < 0) {
-        LOGE("Failed to create server socket");
+        LOGE("Failed to create server socket: errno=%d", errno);
         g_running = false;
         return;
     }
@@ -578,18 +670,20 @@ void server_loop(int port) {
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(static_cast<uint16_t>(port));
 
-    if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-        LOGE("Failed to bind server socket to port %d", port);
+    if (bind(sfd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+        LOGE("Failed to bind 127.0.0.1:%d: errno=%d (%s)",
+             port, errno, strerror(errno));
         close(sfd);
         g_running = false;
         return;
     }
 
     if (listen(sfd, 128) != 0) {
-        LOGE("Failed to listen on server socket");
+        LOGE("Failed to listen on 127.0.0.1:%d: errno=%d (%s)",
+             port, errno, strerror(errno));
         close(sfd);
         g_running = false;
         return;
@@ -598,7 +692,7 @@ void server_loop(int port) {
     g_server_fd = sfd;
     g_server_port = port;
     g_running = true;
-    LOGI("C++ Native Proxy Server started on 127.0.0.1:%d", port);
+    LOGI("C++ Native Proxy Server started on http://127.0.0.1:%d", port);
 
     while (g_running) {
         struct sockaddr_in client_addr;
@@ -635,14 +729,19 @@ int start_proxy(int port) {
 
 void stop_proxy() {
     g_running = false;
+
     int sfd = g_server_fd.exchange(-1);
     if (sfd >= 0) {
         shutdown(sfd, SHUT_RDWR);
         close(sfd);
     }
+
     if (g_server_thread.joinable()) {
         g_server_thread.join();
     }
+
+    g_server_port = 0;
+    LOGI("Native proxy stopped");
 }
 
 } // namespace native_proxy
@@ -691,4 +790,10 @@ Java_com_batz_tvlauncher_proxy_ProxyHandler_nativeRewriteM3U8(
     return env->NewStringUTF(rewritten.c_str());
 }
 
+}
+
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    LOGI("libnative_proxy.so loaded");
+    return JNI_VERSION_1_6;
 }
